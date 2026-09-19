@@ -24,6 +24,7 @@ A complete guide to syncing content into Open WebUI Knowledge Bases.
   - [Cloud Storage (S3 / GCS / Azure)](#cloud-storage-s3--gcs--azure)
   - [SharePoint](#sharepoint)
   - [Nextcloud](#nextcloud)
+  - [LiveSync](#livesync)
   - [All Connectors](#all-connectors)
 - [Filtering](#filtering)
   - [Include / Exclude Globs](#include--exclude-globs)
@@ -472,14 +473,36 @@ Optional settings:
 | `ZOTERO_WEBDAV_URL` | WebDAV Zotero storage base; fetches `<attachment-key>.zip` on Zotero file 404 |
 | `ZOTERO_WEBDAV_USER` / `ZOTERO_WEBDAV_PASSWORD` | WebDAV credentials |
 
+### LiveSync
+
+Sync files from a LiveSync API Gateway to an Open WebUI Knowledge Base. LiveSync uses remote revision tokens for incremental change detection so unchanged files are never re-downloaded.
+
+```bash
+export LIVESYNC_GATEWAY_URL=http://livesync-api-gateway
+export LIVESYNC_GATEWAY_TOKEN=...
+
+oikb sync livesync:Knowledge/software-engineering --kb-id your-kb-id
+```
+
+#### .oikb.yaml example
+
+```yaml
+sources:
+  - name: engineering
+    source: livesync:Knowledge/software-engineering
+    kb-id: ${ENGINEERING_KB_ID}
+    filter:
+      include: ["**/*.md"]
+```
+
 ### All Connectors
 
-46 connectors available. See the full list:
+47 connectors available. See the full list:
 
 | Category | Sources |
 |---|---|
 | **Git** | GitHub, GitLab, Bitbucket |
-| **Cloud Storage** | S3, GCS, Azure Blob, Dropbox, R2, Google Drive, SharePoint, Nextcloud, Egnyte, Oracle Cloud |
+| **Cloud Storage & Sync** | S3, GCS, Azure Blob, Dropbox, R2, Google Drive, SharePoint, Nextcloud, Egnyte, Oracle Cloud, LiveSync |
 | **Wikis & KBs** | Confluence, Notion, BookStack, Discourse, GitBook, Guru, Outline, Slab, Document360, DokuWiki, Google Sites |
 | **Ticketing** | Jira, Linear, Zendesk, Freshdesk, Asana, ClickUp, Airtable, ServiceNow, ProductBoard |
 | **Messaging** | Slack, Discord, Microsoft Teams, Gmail, Zulip |

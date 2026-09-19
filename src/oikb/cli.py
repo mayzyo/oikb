@@ -62,6 +62,12 @@ def _resolve_connector(
     """
     auth = auth or {}
 
+    if source.startswith("livesync:"):
+        from oikb.connectors.livesync import LiveSyncConnector, parse_livesync_source
+        parsed = parse_livesync_source(source)
+        source_root = parsed.pop("root", "")
+        return LiveSyncConnector(root=path or source_root, **{**parsed, **auth})
+
     if source.startswith("github:"):
         from oikb.connectors.github import GitHubConnector, parse_github_source
         parsed = parse_github_source(source)

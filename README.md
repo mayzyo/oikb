@@ -136,12 +136,12 @@ services:
       start_period: 15s
 ```
 
-## 46 Connectors
+## 47 Connectors
 
 | Category | Sources |
 |---|---|
 | **Code Repos** | GitHub, GitLab, Bitbucket |
-| **Cloud Storage** | S3, GCS, Azure Blob, Dropbox, R2, Google Drive, SharePoint, Nextcloud, Egnyte, Oracle Cloud |
+| **Cloud Storage & Sync** | S3, GCS, Azure Blob, Dropbox, R2, Google Drive, SharePoint, Nextcloud, Egnyte, Oracle Cloud, LiveSync |
 | **Wikis & KBs** | Confluence, Notion, BookStack, Discourse, GitBook, Guru, Outline, Slab, Document360, DokuWiki, Google Sites |
 | **Ticketing** | Jira, Linear, Zendesk, Freshdesk, Asana, ClickUp, Airtable, ServiceNow, ProductBoard |
 | **Messaging** | Slack, Discord, Microsoft Teams, Gmail, Zulip |
@@ -155,12 +155,33 @@ services:
 oikb sync github:owner/repo --kb-id your-kb-id
 oikb sync confluence:ENG --kb-id your-kb-id
 oikb sync s3://bucket/prefix --kb-id your-kb-id
+oikb sync livesync:Knowledge/software-engineering --kb-id your-kb-id
 oikb sync nextcloud:/Documents --kb-id your-kb-id
 oikb sync servicenow:incident --kb-id your-kb-id
 oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id
 ```
 
-Some connectors need an optional extra: `pip install oikb[gdrive]`, `pip install oikb[s3]`, `pip install oikb[zotero]`, or `pip install oikb[all]` for everything.
+Some connectors need an optional extra: `pip install oikb[gdrive]`, `pip install oikb[s3]`, `pip install oikb[zotero]`, or `pip install oikb[all]` for everything. LiveSync uses standard HTTP and has no extra dependencies.
+
+### LiveSync
+
+```bash
+export LIVESYNC_GATEWAY_URL=http://livesync-api-gateway
+export LIVESYNC_GATEWAY_TOKEN=...
+
+oikb sync livesync:Knowledge/software-engineering --kb-id your-kb-id
+```
+
+Example `.oikb.yaml` configuration:
+
+```yaml
+sources:
+  - name: engineering
+    source: livesync:Knowledge/software-engineering
+    kb-id: ${ENGINEERING_KB_ID}
+    filter:
+      include: ["**/*.md"]
+```
 
 ### Zotero
 

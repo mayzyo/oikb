@@ -1,0 +1,108 @@
+name: Build and Publish oikb
+run-name: ${{ gitea.actor }} is building oikb
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag to publish alongside the full commit SHA (for example, 0.1.0)
+        required: true
+        default: latest
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: registry.home.destinesiastudio.com
+  OWNER: ${{ gitea.repository_owner }}
+  SHA: ${{ gitea.sha }}
+  IMAGE_TAG: ${{ gitea.event.inputs.tag }}
+  BUILD_RUN_ID: ${{ gitea.run_id }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: docker-build-amd64
+          - arch: arm64
+            runner: docker-build-arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Gitea registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: merrymaybe-bot
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Build and push oikb
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$IMAGE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid image tag: use 1-128 letters, digits, underscores, dots or hyphens; start with a letter, digit or underscore." >&2
+            exit 1
+          fi
+
+          OWNER="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          IMAGE="${REGISTRY}/${OWNER}/oikb"
+          # Separate run/platform tags keep parallel builds from overwriting
+          # each other or publishing an incomplete user-facing image tag.
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          BUILD_TAG="build-${BUILD_RUN_ID}-${SHA}-${ARCH}"
+
+          docker build \
+            --platform "linux/${ARCH}" \
+            --file Dockerfile \
+            --tag "${IMAGE}:${BUILD_TAG}" \
+            .
+          docker push "${IMAGE}:${BUILD_TAG}"
+
+          printf 'Built linux/%s: %s:%s\n' "$ARCH" "$IMAGE" "$BUILD_TAG"
+
+  publish:
+    name: Publish multi-platform image
+    needs: [build]
+    runs-on: docker-build-amd64
+    steps:
+      - name: Ensure Buildx is available for manifest publishing
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Registry manifest operations do not need a dedicated BuildKit container.
+          driver: docker
+
+      - name: Log in to Gitea registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: merrymaybe-bot
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Publish combined image
+        shell: bash
+        run: |
+          set -euo pipefail
+          OWNER="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          IMAGE="${REGISTRY}/${OWNER}/oikb"
+          BUILD_TAG="build-${BUILD_RUN_ID}-${SHA}"
+
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${IMAGE_TAG}" \
+            --tag "${IMAGE}:${SHA}" \
+            "${IMAGE}:${BUILD_TAG}-amd64" \
+            "${IMAGE}:${BUILD_TAG}-arm64"
+
+          docker buildx imagetools inspect "${IMAGE}:${SHA}"
+          printf 'Published %s:%s\nPublished %s:%s\n' "$IMAGE" "$IMAGE_TAG" "$IMAGE" "$SHA"
