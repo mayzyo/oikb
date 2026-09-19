@@ -1,0 +1,9 @@
+{
+  "scopes": [
+    {"name":"productivity","path":"Atlas/Productivity","operations":["list","read","info","write","delete"]},
+    {"name":"agreements","path":"Atlas/Agreements","operations":["list","read","info","write","delete"]},
+    {"name":"driving","path":"Efforts/Driving","operations":["list","read","info","write","delete"]},
+    {"name":"automation","path":"Integrations/Automation","operations":["read","write"]}
+  ],
+  "global_operations": []
+}

@@ -84,7 +84,7 @@ def _next_cron_delay(cron_expr: str) -> float:
 
 # ── Dashboard ────────────────────────────────────────────────────
 
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 _DASHBOARD_HTML = """\
 <!DOCTYPE html>
@@ -146,17 +146,46 @@ async def dashboard():
 )
 async def health():
     """Returns the current sync status for every configured source, including last sync time, duration, file counts, and any errors. Use this to check if syncs are running and healthy."""
-    return {
-        "status": "ok",
+    healthy = _is_ready()
+    return JSONResponse({
+        "status": "ok" if healthy else "degraded",
         "version": __version__,
         "sources": _scheduler_state,
-    }
+    }, status_code=200 if healthy else 503)
+
+
+def _is_ready() -> bool:
+    task = getattr(app.state, "scheduler_task", None)
+    if not _entries or task is None or task.done() or (_shutdown_event and _shutdown_event.is_set()):
+        return False
+    now = time.time()
+    for entry in _entries:
+        state = _scheduler_state.get(entry["source"], {})
+        if state.get("status") not in ("success", "running"):
+            return False
+        # A successful previous run is required, including while a new run is
+        # in progress. Bound overdue/hung jobs independently of cron cadence.
+        if not state.get("last_success"):
+            return False
+        if state.get("status") == "running":
+            if now - state.get("started_at", 0) > 1800:
+                return False
+        elif now > state.get("next_sync_at", state["last_success"]) + 1800:
+            return False
+    return True
 
 
 @app.get("/health/ready", include_in_schema=False)
 async def ready():
-    """Liveness probe."""
-    return {"ready": True}
+    """Readiness reflects scheduler and mirror health; never restarts the pod."""
+    healthy = _is_ready()
+    return JSONResponse({"ready": healthy}, status_code=200 if healthy else 503)
+
+
+@app.get("/livez", include_in_schema=False)
+async def live():
+    """Process liveness, independent of gateway/Open WebUI outages."""
+    return {"status": "ok"}
 
 
 @app.get(
@@ -275,6 +304,7 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
     def set_state(**state):
         for member in entries:
             _scheduler_state[member["source"]] = {
+                **_scheduler_state.get(member["source"], {}),
                 "name": member.get("name", member["source"]), **state,
             }
 
@@ -303,7 +333,9 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
 
         duration_s = time.time() - started_at
         duration_ms = int(duration_s * 1000)
-        status = "success" if not result.errors else "partial"
+        status = "success" if not result.errors and not result.warnings else "partial"
+        if status == "success":
+            set_state(last_success=time.time())
 
         set_state(
             status=status, last_sync=time.time(), duration_ms=duration_ms,
@@ -415,6 +447,7 @@ async def _schedule_entry(entry: dict) -> None:
             _scheduler_state.setdefault(source, {})["next_sync_in"] = f"{interval}s"
 
         try:
+            _scheduler_state.setdefault(source, {})["next_sync_at"] = time.time() + delay
             await asyncio.wait_for(_shutdown_event.wait(), timeout=delay)
             break  # Shutdown requested.
         except asyncio.TimeoutError:

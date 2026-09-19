@@ -15,6 +15,10 @@ from oikb.connectors.livesync import LiveSyncConnector, parse_livesync_source
 from oikb.sync import build_manifest_filter, run_sync
 
 
+def listing(files):
+    return {"status": "success", "count": len(files), "files": files}
+
+
 # ── 1. Source Syntax & Parsing ──────────────────────────────────────
 
 
@@ -96,26 +100,31 @@ def test_init_explicit_args():
 @respx.mock
 def test_list_hierarchy_and_read_file():
     gw_url = "http://livesync-gateway"
-    files_payload = [
-        {
-            "path": "domain-reference/open-webui.md",
-            "size": 1234,
-            "revision": "rev-101",
-        },
-        {
-            "path": "overview.md",
-            "size": 500,
-            "revision": "rev-102",
-        },
-    ]
-    respx.get(f"{gw_url}/files").mock(
+    files_payload = {
+        "status": "success",
+        "path": "Knowledge/software-engineering",
+        "count": 2,
+        "files": [
+            {
+                "path": "Knowledge/software-engineering/domain-reference/open-webui.md",
+                "size": 1234,
+                "revision": "rev-101",
+            },
+            {
+                "path": "Knowledge/software-engineering/overview.md",
+                "size": 500,
+                "revision": "rev-102",
+            },
+        ],
+    }
+    list_route = respx.post(f"{gw_url}/hooks/livesync-list").mock(
         return_value=httpx.Response(200, json=files_payload)
     )
-    respx.get(f"{gw_url}/files/domain-reference/open-webui.md").mock(
-        return_value=httpx.Response(200, content=b"# Open WebUI Architecture")
-    )
-    respx.get(f"{gw_url}/files/overview.md").mock(
-        return_value=httpx.Response(200, content=b"# Overview Notes")
+    read_route = respx.post(f"{gw_url}/hooks/livesync-read").mock(
+        side_effect=[
+            httpx.Response(200, content=b"# Open WebUI Architecture"),
+            httpx.Response(200, content=b"# Overview Notes"),
+        ]
     )
 
     connector = LiveSyncConnector(
@@ -125,6 +134,9 @@ def test_list_hierarchy_and_read_file():
     )
     try:
         manifest = connector.build_manifest()
+        assert json.loads(list_route.calls[0].request.content) == {
+            "path": "Knowledge/software-engineering"
+        }
         assert len(manifest) == 2
 
         # Manifest is sorted by display_path
@@ -148,6 +160,14 @@ def test_list_hierarchy_and_read_file():
 
         content2 = connector.read_file("", "overview.md")
         assert content2 == b"# Overview Notes"
+        assert [json.loads(call.request.content) for call in read_route.calls] == [
+            {
+                "path": "Knowledge/software-engineering/domain-reference/open-webui.md"
+            },
+            {
+                "path": "Knowledge/software-engineering/overview.md"
+            },
+        ]
     finally:
         connector.close()
 
@@ -165,12 +185,12 @@ def test_nested_folders():
             "revision": "hash-go-42",
         }
     ]
-    respx.get(f"{gw_url}/files").mock(
-        return_value=httpx.Response(200, json=files_payload)
+    respx.post(f"{gw_url}/hooks/livesync-list").mock(
+        return_value=httpx.Response(200, json=listing(files_payload))
     )
-    respx.get(
-        f"{gw_url}/files/Knowledge/software-engineering/backend/services/auth/service.go"
-    ).mock(return_value=httpx.Response(200, content=b"package auth"))
+    read_route = respx.post(f"{gw_url}/hooks/livesync-read").mock(
+        return_value=httpx.Response(200, content=b"package auth")
+    )
 
     connector = LiveSyncConnector(
         root="Knowledge/software-engineering",
@@ -189,6 +209,9 @@ def test_nested_folders():
 
         data = connector.read_file("backend/services/auth", "service.go")
         assert data == b"package auth"
+        assert json.loads(read_route.calls[0].request.content) == {
+            "path": "Knowledge/software-engineering/backend/services/auth/service.go"
+        }
     finally:
         connector.close()
 
@@ -199,8 +222,8 @@ def test_nested_folders():
 @respx.mock
 def test_empty_source():
     gw_url = "http://livesync-gateway"
-    respx.get(f"{gw_url}/files").mock(
-        return_value=httpx.Response(200, json=[])
+    respx.post(f"{gw_url}/hooks/livesync-list").mock(
+        return_value=httpx.Response(200, json=listing([]))
     )
 
     connector = LiveSyncConnector(root="EmptyFolder", gateway_url=gw_url)
@@ -217,8 +240,8 @@ def test_empty_source():
 @respx.mock
 def test_auth_headers_and_unauthorized():
     gw_url = "http://livesync-gateway"
-    list_route = respx.get(f"{gw_url}/files").mock(
-        return_value=httpx.Response(200, json=[])
+    list_route = respx.post(f"{gw_url}/hooks/livesync-list").mock(
+        return_value=httpx.Response(200, json=listing([]))
     )
 
     connector = LiveSyncConnector(
@@ -235,7 +258,7 @@ def test_auth_headers_and_unauthorized():
         connector.close()
 
     # Unauthorized test
-    respx.get(f"{gw_url}/files").mock(
+    respx.post(f"{gw_url}/hooks/livesync-list").mock(
         return_value=httpx.Response(401, text="Unauthorized")
     )
     with LiveSyncConnector(root="docs", gateway_url=gw_url, token="bad-token") as conn:
@@ -250,7 +273,7 @@ def test_auth_headers_and_unauthorized():
 @respx.mock
 def test_gateway_errors_and_file_unavailable():
     gw_url = "http://livesync-gateway"
-    respx.get(f"{gw_url}/files").mock(
+    respx.post(f"{gw_url}/hooks/livesync-list").mock(
         return_value=httpx.Response(500, text="Internal Server Error")
     )
 
@@ -260,13 +283,13 @@ def test_gateway_errors_and_file_unavailable():
         assert exc_info.value.response.status_code == 500
 
     # 404 on read raises SourceFileUnavailable
-    respx.get(f"{gw_url}/files").mock(
+    respx.post(f"{gw_url}/hooks/livesync-list").mock(
         return_value=httpx.Response(
             200,
-            json=[{"path": "missing.txt", "size": 10, "revision": "1"}],
+            json=listing([{"path": "missing.txt", "size": 10, "revision": "1"}]),
         )
     )
-    respx.get(f"{gw_url}/files/missing.txt").mock(
+    respx.post(f"{gw_url}/hooks/livesync-read").mock(
         return_value=httpx.Response(404, text="Not Found")
     )
 
@@ -280,24 +303,20 @@ def test_gateway_errors_and_file_unavailable():
 
 
 @respx.mock
-def test_duplicate_paths_deduplicated():
+def test_duplicate_paths_rejected():
     gw_url = "http://livesync-gateway"
     # Gateway returns duplicate path entries (e.g. earlier revision then updated revision)
     files_payload = [
         {"path": "notes/todo.md", "size": 100, "revision": "rev-old"},
         {"path": "notes/todo.md", "size": 250, "revision": "rev-new"},
     ]
-    respx.get(f"{gw_url}/files").mock(
-        return_value=httpx.Response(200, json=files_payload)
+    respx.post(f"{gw_url}/hooks/livesync-list").mock(
+        return_value=httpx.Response(200, json=listing(files_payload))
     )
 
     with LiveSyncConnector(root="", gateway_url=gw_url) as conn:
-        manifest = conn.build_manifest()
-        assert len(manifest) == 1
-        entry = manifest[0]
-        assert entry.display_path == "notes/todo.md"
-        assert entry.checksum == "rev-new"
-        assert entry.size == 250
+        with pytest.raises(ValueError, match="Duplicate"):
+            conn.build_manifest()
 
 
 # ── 9. Revision Changes & Deleted Files ─────────────────────────────
@@ -309,13 +328,13 @@ def test_revision_changes_and_deleted_files():
     client = Mock()
 
     # Scenario 1: Initial state
-    respx.get(f"{gw_url}/files").mock(
+    respx.post(f"{gw_url}/hooks/livesync-list").mock(
         return_value=httpx.Response(
             200,
-            json=[
+            json=listing([
                 {"path": "doc1.md", "size": 10, "revision": "v1"},
                 {"path": "doc2.md", "size": 20, "revision": "v1"},
-            ],
+            ]),
         )
     )
     with LiveSyncConnector(root="", gateway_url=gw_url) as conn:
@@ -326,12 +345,12 @@ def test_revision_changes_and_deleted_files():
         }
 
     # Scenario 2: Revision changed for doc1.md, doc2.md was deleted
-    respx.get(f"{gw_url}/files").mock(
+    respx.post(f"{gw_url}/hooks/livesync-list").mock(
         return_value=httpx.Response(
             200,
-            json=[
+            json=listing([
                 {"path": "doc1.md", "size": 15, "revision": "v2"},
-            ],
+            ]),
         )
     )
     with LiveSyncConnector(root="", gateway_url=gw_url) as conn:
@@ -398,21 +417,21 @@ def test_cli_diff_milestone(monkeypatch):
     monkeypatch.setenv("OPEN_WEBUI_API_KEY", "sk-webui-token")
 
     # Mock LiveSync gateway
-    respx.get(f"{gw_url}/files").mock(
+    respx.post(f"{gw_url}/hooks/livesync-list").mock(
         return_value=httpx.Response(
             200,
-            json=[
+            json=listing([
                 {
-                    "path": "domain-reference/open-webui.md",
+                    "path": "Knowledge/software-engineering/domain-reference/open-webui.md",
                     "size": 1234,
                     "revision": "rev-1",
                 },
                 {
-                    "path": "guide.md",
+                    "path": "Knowledge/software-engineering/guide.md",
                     "size": 800,
                     "revision": "rev-2",
                 },
-            ],
+            ]),
         )
     )
 
@@ -465,34 +484,36 @@ def test_cli_diff_milestone(monkeypatch):
 
 
 @respx.mock
-def test_full_sync_and_incremental_diff():
+def test_full_sync_and_incremental_diff(monkeypatch):
+    # Processing/link polling is covered independently in test_sync_safety.py.
+    monkeypatch.setattr(OikbClient, "wait_for_processing", lambda *args: None)
     gw_url = "http://livesync-gateway"
     webui_url = "http://openwebui-api"
     kb_id = "test-kb-id"
 
     # Gateway serves 2 files
-    respx.get(f"{gw_url}/files").mock(
+    respx.post(f"{gw_url}/hooks/livesync-list").mock(
         return_value=httpx.Response(
             200,
-            json=[
+            json=listing([
                 {
-                    "path": "domain-reference/open-webui.md",
+                    "path": "Knowledge/software-engineering/domain-reference/open-webui.md",
                     "size": 12,
                     "revision": "rev-1",
                 },
                 {
-                    "path": "readme.md",
+                    "path": "Knowledge/software-engineering/readme.md",
                     "size": 6,
                     "revision": "rev-2",
                 },
-            ],
+            ]),
         )
     )
-    respx.get(f"{gw_url}/files/domain-reference/open-webui.md").mock(
-        return_value=httpx.Response(200, content=b"docs content")
-    )
-    respx.get(f"{gw_url}/files/readme.md").mock(
-        return_value=httpx.Response(200, content=b"readme")
+    respx.post(f"{gw_url}/hooks/livesync-read").mock(
+        side_effect=[
+            httpx.Response(200, content=b"docs content"),
+            httpx.Response(200, content=b"readme"),
+        ]
     )
 
     # First sync: both files are added
@@ -574,14 +595,14 @@ def test_full_sync_and_incremental_diff():
 @respx.mock
 def test_folder_filtering():
     gw_url = "http://livesync-gateway"
-    respx.get(f"{gw_url}/files").mock(
+    respx.post(f"{gw_url}/hooks/livesync-list").mock(
         return_value=httpx.Response(
             200,
-            json=[
+            json=listing([
                 {"path": "docs/architecture.md", "size": 100, "revision": "1"},
                 {"path": "docs/image.png", "size": 2000, "revision": "2"},
                 {"path": "notes.txt", "size": 50, "revision": "3"},
-            ],
+            ]),
         )
     )
 

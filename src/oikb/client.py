@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import httpx
@@ -14,7 +15,10 @@ class OikbClient:
     All methods are synchronous — httpx handles connection pooling internally.
     """
 
-    def __init__(self, base_url: str, token: str, timeout: float = 120.0):
+    def __init__(self, base_url: str, token: str, timeout: float = 120.0,
+                 processing_timeout: float = 300.0, poll_interval: float = 1.0):
+        self._processing_timeout = processing_timeout
+        self._poll_interval = poll_interval
         self._base_url = base_url.rstrip("/")
         self._http = httpx.Client(
             base_url=f"{self._base_url}/api/v1",
@@ -88,7 +92,58 @@ class OikbClient:
             data={"metadata": json.dumps(metadata)},
         )
         resp.raise_for_status()
-        return resp.json()
+        uploaded = resp.json()
+        file_id = uploaded.get("id")
+        if not file_id:
+            raise RuntimeError("Upload response did not contain a file ID")
+        try:
+            self.wait_for_processing(file_id, kb_id, filename)
+        except Exception as exc:
+            # Once accepted, retrying POST can create duplicate files. Leave
+            # recovery to the next run instead of retrying an accepted upload.
+            raise RuntimeError(f"Upload {file_id} accepted but not confirmed: {exc}") from exc
+        return uploaded
+
+    def wait_for_processing(self, file_id: str, kb_id: str, filename: str = "") -> None:
+        """Wait for indexing AND the durable KB link before replacing old data."""
+        deadline = time.monotonic() + self._processing_timeout
+        while time.monotonic() < deadline:
+            resp = self._http.get(f"/files/{file_id}/process/status")
+            resp.raise_for_status()
+            state = resp.json()
+            if state.get("status") == "failed":
+                raise RuntimeError(f"File processing failed: {state.get('error', file_id)}")
+            if state.get("status") == "completed":
+                # The diff collapses duplicate filenames; use the paginated
+                # file list to verify the exact new ID, including replacements.
+                page, seen = 1, 0
+                while time.monotonic() < deadline:
+                    linked = self._http.get(f"/knowledge/{kb_id}/files", params={"query": filename, "page": page})
+                    linked.raise_for_status()
+                    data = linked.json()
+                    items = data["items"]
+                    if any(item["id"] == file_id for item in items):
+                        return
+                    seen += len(items)
+                    if not items or seen >= data["total"]:
+                        break
+                    page += 1
+            time.sleep(self._poll_interval)
+        raise TimeoutError(f"Timed out waiting for indexing/KB linking of {file_id}; old file retained")
+
+    def cleanup_replacement(self, kb_id: str, old_id: str, new_id: str) -> None:
+        """Protect against Open WebUI's hash-wide vector cleanup."""
+        hashes = []
+        for file_id in (old_id, new_id):
+            resp = self._http.get(f"/files/{file_id}")
+            resp.raise_for_status()
+            hashes.append(resp.json().get("hash"))
+        if not all(hashes) or hashes[0] == hashes[1]:
+            raise RuntimeError("Replacement has missing or identical indexed content hash; preserving old file to avoid deleting shared vectors")
+        try:
+            self.sync_cleanup(kb_id, [old_id])
+        except Exception as exc:
+            raise RuntimeError(f"Replacement indexed but stale-file cleanup failed: {exc}") from exc
 
     # ── Directory management ────────────────────────────────────
 

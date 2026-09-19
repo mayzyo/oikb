@@ -284,8 +284,53 @@ oikb history --clear --days 7   # Prune old entries
 
 1. Scan source, compute checksums
 2. Send manifest to Open WebUI `/sync/diff`
-3. Delete stale files, create missing directories
-4. Upload only new and modified files
+3. Create missing directories
+4. Upload new and modified files; wait for indexing and durable KB linking
+5. Remove each successfully replaced old file, then remove source deletions only
+   when the entire run completed without errors or warnings
+
+### LiveSync mirror safety
+
+The native connector calls the gateway directly, with no adapter. Independent
+sources such as `livesync:Atlas/Productivity`, `livesync:Atlas/Agreements` and
+`livesync:Efforts/Driving` can target separately named KBs. Use a dedicated KB for
+each mirror: a successful empty source manifest removes its last mirrored file.
+Malformed/incomplete listings, duplicate paths, out-of-root files and LiveSync
+conflicts abort scanning before any destination mutation.
+
+With a shared scope catalogue, use `livesync:?scope=productivity` and set
+`LIVESYNC_SCOPES_FILE=/etc/livesync-scopes/scopes.json`. The native connector
+resolves the named scope's path from that JSON file; no adapter or generated
+configuration is involved. Missing scopes or missing list/read permission abort
+the scan. Existing `livesync:Atlas/Productivity` sources still work. Scope names
+are independent of KB names, and the catalogue can include extra gateway-only
+scopes for other services that OIKB never mirrors. See cluster-configs
+`kubernetes/obsidian-notes/scopes.yaml` and `configmap.yaml` for the deployment.
+
+Uploads are not counted as successful until Open WebUI reports completed
+processing and the new file ID is linked to the destination KB. Empty files are
+submitted normally; if Open WebUI cannot index them, the run reports an error
+and retains the old indexed version. Missing source files also retain their old
+version and mark the run partial. Cleanup is not a distributed transaction: a
+process crash or cleanup failure after upload can leave duplicate versions that
+need reconciliation. Never reset the KB merely to recover a failed upload.
+
+Some Open WebUI versions remove vectors by content hash during cleanup. OIKB
+therefore refuses replacement cleanup when old/new indexed hashes match or are
+missing, preserving data and reporting the issue instead of silently deleting
+shared vectors. Resolve such duplicate-content cases in Open WebUI before
+retrying; a backend transaction is needed for completely atomic replacements.
+
+The daemon's `/livez` is independent of remote outages. `/health/ready` and
+`/health` return 503 for failed/partial mirrors, dead schedulers, or overdue jobs.
+Use `/livez` for startup/liveness and `/health/ready` for readiness.
+
+CI automatically builds/publishes on `main`, using the checked-in lockfile. It
+tests the connector against the published gateway image, so merge the gateway
+changes first. `tests/test_gateway_contract.py` is opt-in locally via
+`OIKB_TEST_GATEWAY_URL`, `OIKB_TEST_GATEWAY_TOKEN`, and
+`LIVESYNC_SCOPES_FILE=tests/fixtures/livesync-scopes.json`; use a disposable
+gateway configured with the same scope fixture.
 
 ## License
 

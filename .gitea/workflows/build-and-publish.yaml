@@ -2,6 +2,9 @@ name: Build and Publish oikb
 run-name: ${{ gitea.actor }} is building oikb
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
     inputs:
       tag:
@@ -17,11 +20,48 @@ env:
   REGISTRY: registry.home.destinesiastudio.com
   OWNER: ${{ gitea.repository_owner }}
   SHA: ${{ gitea.sha }}
-  IMAGE_TAG: ${{ gitea.event.inputs.tag }}
+  IMAGE_TAG: ${{ gitea.event.inputs.tag || 'latest' }}
   BUILD_RUN_ID: ${{ gitea.run_id }}
 
 jobs:
+  test:
+    runs-on: docker-build-amd64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python regression tests
+        run: docker run --rm -v "$PWD:/src" -w /src ghcr.io/astral-sh/uv:0.11.29-python3.11-bookworm-slim sh -ec 'UV_PROJECT_ENVIRONMENT=/tmp/test-venv uv run --frozen --extra dev pytest -q'
+      - name: Log in for cross-repository contract test
+        if: gitea.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: merrymaybe-bot
+          password: ${{ secrets.REGISTRY_TOKEN }}
+      - name: Test connector against published gateway and real CLI
+        if: gitea.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          network="oikb-contract-${BUILD_RUN_ID}"
+          container="${network}-gateway"
+          trap 'docker rm -fv "$container" >/dev/null 2>&1 || true; docker network rm "$network" >/dev/null 2>&1 || true' EXIT
+          docker network create "$network"
+          docker run -d --name "$container" --network "$network" --network-alias gateway --pull always \
+            -e GATEWAY_API_KEY=contract-test \
+            -v "$PWD/tests/fixtures/livesync-scopes.json:/etc/livesync-scopes/scopes.json:ro" \
+            -e LIVESYNC_SCOPES_FILE=/etc/livesync-scopes/scopes.json \
+            -e SYNC_ON_READ=false -e SYNC_ON_WRITE=false \
+            -e 'LIVESYNC_SETTINGS_JSON={"isConfigured":true,"couchDB_URI":"http://127.0.0.1:1","couchDB_DBNAME":"test","couchDB_USER":"test","couchDB_PASSWORD":"test","useIndexedDBAdapter":false,"liveSync":false,"syncOnStart":false}' \
+            registry.home.destinesiastudio.com/destinesiastudio/livesync-api-gateway:latest
+          docker run --rm --network "$network" -v "$PWD:/src" -w /src \
+            -e OIKB_TEST_GATEWAY_URL=http://gateway:9000 -e OIKB_TEST_GATEWAY_TOKEN=contract-test \
+            -e LIVESYNC_SCOPES_FILE=/src/tests/fixtures/livesync-scopes.json \
+            ghcr.io/astral-sh/uv:0.11.29-python3.11-bookworm-slim \
+            sh -ec 'UV_PROJECT_ENVIRONMENT=/tmp/test-venv uv run --frozen --extra dev pytest -q tests/test_gateway_contract.py'
+
   build:
+    needs: [test]
+    if: gitea.event_name != 'pull_request'
     name: Build ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     strategy:

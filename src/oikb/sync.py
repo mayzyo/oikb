@@ -1,4 +1,4 @@
-"""Sync orchestrator — diff → cleanup → mkdir → upload."""
+"""Sync orchestrator: diff, create directories, confirm uploads, then cleanup."""
 
 from __future__ import annotations
 
@@ -148,9 +148,9 @@ def run_sync(
       1. Build manifest from connector
       2. Apply optional manifest filter
       3. POST manifest to /sync/diff
-      4. Cleanup stale files (delete before upload)
-      5. Create missing directories
-      6. Upload added + modified files
+      4. Create missing directories
+      5. Upload and confirm added + modified files before replacing old files
+      6. Delete absent source files only after a fully successful scan/upload
     """
     result = SyncResult()
     result.errors = []
@@ -205,11 +205,6 @@ def _run_sync_inner(
             _console.print(f"  [dim]{len(manifest)} files after filtering[/dim]")
         elif verbose:
             click.echo(f"  {len(manifest)} files after filtering", err=True)
-
-    if not manifest:
-        if not quiet:
-            click.echo("Source is empty — nothing to sync.", err=True)
-        return result
 
     # ── 3. Compute diff ────────────────────────────────────────
     check_stop()
@@ -283,26 +278,6 @@ def _run_sync_inner(
         return result
 
     # ── 4. Cleanup stale files ─────────────────────────────────
-    stale_file_ids = [
-        *[d["file_id"] for d in deleted],
-        *[m["stale_file_id"] for m in modified],
-    ]
-
-    if stale_file_ids or rmdir:
-        check_stop()
-        if show_progress:
-            with _console.status(f"[bold blue]Cleaning up {len(stale_file_ids)} stale files..."):
-                client.sync_cleanup(kb_id, stale_file_ids, rmdir if rmdir else None)
-        else:
-            if verbose:
-                click.echo(
-                    f"Cleaning up {len(stale_file_ids)} files, {len(rmdir)} dirs...",
-                    err=True,
-                )
-            client.sync_cleanup(kb_id, stale_file_ids, rmdir if rmdir else None)
-        result.deleted = len(deleted)
-        result.dirs_removed = len(rmdir)
-
     # ── 5. Create missing directories ──────────────────────────
     for dir_path in mkdir:
         check_stop()
@@ -326,9 +301,6 @@ def _run_sync_inner(
         *[(m, "modified") for m in modified],
     ]
 
-    if not files_to_upload:
-        return result
-
     def _upload_one(
         i: int, entry: dict, change_type: str, progress: Progress | None, task_id: Any,
     ) -> tuple[str, str | None]:
@@ -346,25 +318,26 @@ def _run_sync_inner(
             return ("error", f"File not in manifest: {display}")
 
         last_err: Exception | None = None
+        upload_confirmed = False
         for attempt in range(3):
             check_stop()
             try:
                 content = connector.read_file(path, filename)
-                if not content:
-                    if progress is not None:
-                        progress.update(task_id, advance=1, description=f"[yellow]⚠ {display}[/yellow]")
-                    else:
-                        click.echo(click.style(f"  ⚠ {display}: empty content, skipping", fg="yellow"), err=True)
-                    return ("warning", f"{display}: empty content, skipping")
                 check_stop()
                 directory_id = directory_map.get(path) if path else None
-                client.upload_file(
+                uploaded = client.upload_file(
                     file_content=content,
                     filename=filename,
                     kb_id=kb_id,
                     file_hash=manifest_entry.checksum,
                     directory_id=directory_id,
                 )
+                upload_confirmed = True
+                # upload_file only succeeds after indexing and KB linking.
+                # Keep the old version for read/upload/indexing failures.
+                if change_type == "modified":
+                    check_stop()
+                    client.cleanup_replacement(kb_id, entry["stale_file_id"], uploaded["id"])
                 if progress is not None:
                     progress.update(task_id, advance=1, description=f"[cyan]{display}[/cyan]")
                 return (change_type, None)
@@ -376,7 +349,7 @@ def _run_sync_inner(
                     click.echo(click.style(f"  ⚠ {message}", fg="yellow"), err=True)
                 return ("warning", message)
             except httpx.HTTPStatusError as e:
-                if e.response.status_code >= 500 and attempt < 2:
+                if not upload_confirmed and e.response.status_code >= 500 and attempt < 2:
                     time.sleep(2 ** attempt)
                     check_stop()
                     last_err = e
@@ -455,6 +428,12 @@ def _run_sync_inner(
             for i, (entry, change_type) in enumerate(files_to_upload, 1):
                 _tally(_upload_one(i, entry, change_type, None, None))
 
+    # A partial run is not authoritative enough to remove unrelated old data.
+    if not result.errors and not result.warnings and (deleted or rmdir):
+        check_stop()
+        client.sync_cleanup(kb_id, [d["file_id"] for d in deleted], rmdir or None)
+        result.deleted = len(deleted)
+        result.dirs_removed = len(rmdir)
     return result
 
 
