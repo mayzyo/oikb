@@ -53,13 +53,16 @@ jobs:
           network="oikb-contract-${BUILD_RUN_ID}"
           container="${network}-gateway"
           test_container="${network}-tests"
-          trap 'docker rm -fv "$test_container" "$container" >/dev/null 2>&1 || true; docker network rm "$network" >/dev/null 2>&1 || true' EXIT
+          trap 'status=$?; if [ "$status" -ne 0 ]; then echo "Gateway container logs:" >&2; docker logs "$container" >&2 || true; fi; docker rm -fv "$test_container" "$container" >/dev/null 2>&1 || true; docker network rm "$network" >/dev/null 2>&1 || true; exit "$status"' EXIT
           docker network create "$network"
+          # A gateway publish can race this cross-repository job. Keep the old
+          # variable only as a compatibility input for the previously published image.
           docker create --name "$container" --network "$network" --network-alias gateway --pull always \
             -e GATEWAY_API_KEY=contract-test \
             -e LIVESYNC_SCOPES_FILE=/tmp/livesync-scopes.json \
             -e SYNC_ON_READ=false -e SYNC_ON_WRITE=false \
-            -e COUCHDB_URI=http://127.0.0.1:1 -e LIVESYNC_VAULT_DATABASE=test \
+            -e COUCHDB_URI=http://127.0.0.1:1 \
+            -e LIVESYNC_VAULT_DATABASE=test -e COUCHDB_DBNAME=test \
             -e COUCHDB_USER=test -e COUCHDB_PASSWORD=test -e LIVESYNC_ENCRYPT=false \
             registry.home.destinesiastudio.com/destinesiastudio/livesync-api-gateway:latest
           docker cp tests/fixtures/livesync-scopes.json "$container:/tmp/livesync-scopes.json"
