@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from unittest.mock import Mock
 
 import httpx
@@ -143,15 +144,15 @@ def test_list_hierarchy_and_read_file():
         first = manifest[0]
         assert first.filename == "open-webui.md"
         assert first.path == "domain-reference"
-        assert first.checksum == "rev-101"
-        assert first.size == 1234
+        assert first.checksum == hashlib.sha256(b"# Open WebUI Architecture").hexdigest()
+        assert first.size == len(b"# Open WebUI Architecture")
         assert first.display_path == "domain-reference/open-webui.md"
 
         second = manifest[1]
         assert second.filename == "overview.md"
         assert second.path == ""
-        assert second.checksum == "rev-102"
-        assert second.size == 500
+        assert second.checksum == hashlib.sha256(b"# Overview Notes").hexdigest()
+        assert second.size == len(b"# Overview Notes")
         assert second.display_path == "overview.md"
 
         # Read file contents
@@ -205,7 +206,7 @@ def test_nested_folders():
         assert (
             entry.display_path == "backend/services/auth/service.go"
         )
-        assert entry.checksum == "hash-go-42"
+        assert entry.checksum == hashlib.sha256(b"package auth").hexdigest()
 
         data = connector.read_file("backend/services/auth", "service.go")
         assert data == b"package auth"
@@ -294,9 +295,8 @@ def test_gateway_errors_and_file_unavailable():
     )
 
     with LiveSyncConnector(root="", gateway_url=gw_url) as conn:
-        conn.build_manifest()
         with pytest.raises(SourceFileUnavailable, match="not found on LiveSync gateway"):
-            conn.read_file("", "missing.txt")
+            conn.build_manifest()
 
 
 # ── 8. Duplicate Paths Handling ─────────────────────────────────────
@@ -326,6 +326,7 @@ def test_duplicate_paths_rejected():
 def test_revision_changes_and_deleted_files():
     gw_url = "http://livesync-gateway"
     client = Mock()
+    read_route = respx.post(f"{gw_url}/hooks/livesync-read").respond(200, content=b"first")
 
     # Scenario 1: Initial state
     respx.post(f"{gw_url}/hooks/livesync-list").mock(
@@ -340,11 +341,12 @@ def test_revision_changes_and_deleted_files():
     with LiveSyncConnector(root="", gateway_url=gw_url) as conn:
         manifest1 = conn.build_manifest()
         assert {m.filename: m.checksum for m in manifest1} == {
-            "doc1.md": "v1",
-            "doc2.md": "v1",
+            "doc1.md": hashlib.sha256(b"first").hexdigest(),
+            "doc2.md": hashlib.sha256(b"first").hexdigest(),
         }
 
     # Scenario 2: Revision changed for doc1.md, doc2.md was deleted
+    read_route.respond(200, content=b"second")
     respx.post(f"{gw_url}/hooks/livesync-list").mock(
         return_value=httpx.Response(
             200,
@@ -357,7 +359,7 @@ def test_revision_changes_and_deleted_files():
         manifest2 = conn.build_manifest()
         assert len(manifest2) == 1
         assert manifest2[0].filename == "doc1.md"
-        assert manifest2[0].checksum == "v2"
+        assert manifest2[0].checksum == hashlib.sha256(b"second").hexdigest()
 
     # Verify Open WebUI diff API would receive these checksums
     client.sync_diff.return_value = {
@@ -410,6 +412,7 @@ def test_cli_diff_milestone(monkeypatch):
     gw_url = "http://livesync-gateway"
     webui_url = "http://openwebui-api"
     kb_id = "test-kb-id"
+    respx.post(f"{gw_url}/hooks/livesync-read").respond(200, content=b"new content")
 
     monkeypatch.setenv("LIVESYNC_GATEWAY_URL", gw_url)
     monkeypatch.setenv("LIVESYNC_GATEWAY_TOKEN", "gw-token")
@@ -561,6 +564,10 @@ def test_full_sync_and_incremental_diff(monkeypatch):
     assert upload_route.call_count == 2
 
     # Second sync: no changes in gateway, Open WebUI reports all unmodified
+    respx.post(f"{gw_url}/hooks/livesync-read").mock(side_effect=[
+        httpx.Response(200, content=b"docs content"),
+        httpx.Response(200, content=b"readme"),
+    ])
     respx.post(f"{webui_url}/api/v1/knowledge/{kb_id}/sync/diff").mock(
         return_value=httpx.Response(
             200,
@@ -595,6 +602,7 @@ def test_full_sync_and_incremental_diff(monkeypatch):
 @respx.mock
 def test_folder_filtering():
     gw_url = "http://livesync-gateway"
+    respx.post(f"{gw_url}/hooks/livesync-read").respond(200, content=b"content")
     respx.post(f"{gw_url}/hooks/livesync-list").mock(
         return_value=httpx.Response(
             200,

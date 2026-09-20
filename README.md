@@ -1,337 +1,77 @@
-# 📚 oikb
+# oikb
 
-Keep your [Open WebUI](https://github.com/open-webui/open-webui) Knowledge Bases in sync. Point it at a local directory, a GitHub repo, a Confluence space, an S3 bucket, Zotero, or any of 46 supported sources. Only new and modified files are uploaded via incremental SHA-256 diffing.
+Sync local files, repositories, cloud storage and LiveSync notes into Open WebUI
+Knowledge Bases. Requires Open WebUI 0.9.6+.
 
-> [!IMPORTANT]
-> Requires **Open WebUI 0.9.6+**
+## Quick start
 
-## Quick Start
+Install this checkout and preview a sync:
 
-```bash
-pip install oikb
-
+```sh
+pip install .
 export OPEN_WEBUI_URL=http://localhost:3000
-export OPEN_WEBUI_API_KEY=sk-your-api-key
-
-# Sync a directory
-oikb sync ./docs --kb-id your-kb-id
-
-# Sync a GitHub repo
-oikb sync github:owner/repo --kb-id your-kb-id
-
-# Preview first (no upload)
+export OPEN_WEBUI_API_KEY=your-api-key
 oikb sync ./docs --kb-id your-kb-id --dry-run
 ```
 
-For multi-source, scheduled sync, or daemon mode — run `oikb init` to generate a `.oikb.yaml` config file, then `oikb daemon`.
+Remove `--dry-run` to sync. Use `oikb --help` or the [full guide](docs/guide.md)
+for other connectors, authentication, filters, webhooks and deployment.
 
-📖 **[Full Guide](docs/guide.md)** — installation, connectors, daemon, enterprise features, deployment, troubleshooting.
+## LiveSync
 
-## Commands
-
-| Command | Description |
-|---|---|
-| `oikb init` | Generate `.oikb.yaml` interactively |
-| `oikb sync <source>` | Incremental sync to a Knowledge Base |
-| `oikb watch <dir>` | Watch for changes and auto-sync |
-| `oikb daemon` | Long-lived scheduler with HTTP API |
-| `oikb diff <source>` | Preview what a sync would do |
-| `oikb validate` | Validate `.oikb.yaml` without running |
-| `oikb history` | View sync history |
-| `oikb ls` | List files in a Knowledge Base |
-| `oikb status` | Show KB info and file count |
-| `oikb reset` | Delete all files in a Knowledge Base |
-| `oikb config` | Manage saved URL and API key |
-
-## Daemon
-
-Run `oikb daemon` for production deployments. Reads `.oikb.yaml` and syncs each source on a schedule.
-
-```bash
-oikb daemon --port 8080
+```sh
+export LIVESYNC_GATEWAY_URL=http://livesync-api-gateway:9000
+export LIVESYNC_GATEWAY_TOKEN=your-gateway-key
 ```
 
-Features:
-- **Scheduled sync** — simple intervals (`30m`, `1h`) or cron expressions (`0 6 * * 1-5`)
-- **Webhooks** — instant sync on push via `/webhooks/github`, `/webhooks/gitlab`, `/webhooks/slack`, `/webhooks/confluence`
-- **Health checks** — `GET /health` for Docker/K8s readiness probes
-- **Prometheus metrics** — `GET /metrics` exports sync counters, duration histograms, and error rates
-- **Sync history** — `GET /history` queryable log of all syncs
-- **On-demand sync** — `POST /sync/{identifier}` trigger by `name` or `kb-id`
-- **Failure notifications** — webhook POST on sync errors, compatible with Slack, PagerDuty, Opsgenie
-- **API key auth** — set `OIKB_API_KEY` to secure endpoints (Docker secrets `_FILE` supported)
-- **OpenAPI tool server** — add `http://oikb:8080` as a Tool Server in Open WebUI (Settings → Connections) and let the LLM trigger syncs, check status, and query history
+Create `.oikb.yaml`, then run `oikb daemon`:
 
 ```yaml
-# .oikb.yaml
 defaults:
-  interval: 1h
-  concurrency: 4
-  filter:
-    max-size: 50mb
-  notify:
-    url: https://hooks.slack.com/services/T.../B.../xxx
-    on: error
-
+  interval: 5m
 sources:
-  - name: wiki
-    source: github:owner/repo
-    kb-id: 8f3a2b1c-...
-    webhook: true
-
-  - name: handbook
-    source: confluence:ENG
-    kb-id: 4e7d9a0f-...
-    interval: "0 6 * * 1-5"   # overrides default
+  - name: productivity
+    source: livesync:Atlas/Productivity
+    kb-id: your-kb-id
 ```
 
-```bash
-oikb sync --name wiki          # CLI: sync a specific entry
-curl -X POST /sync/wiki        # API: trigger by name
-curl -X POST /sync/8f3a2b1c-.. # API: trigger by kb-id
-```
+Add entries for other folders/KBs. Named scopes use `livesync:?scope=productivity`
+and `LIVESYNC_SCOPES_FILE`, pointing to the shared gateway scope catalogue.
+Scopes must allow `list` and `read`; KB names need not match scope names.
+Set `OIKB_API_KEY` to protect daemon control endpoints.
 
-### Docker
+### Behavior and limits
 
-```bash
-docker run -d \
-  -e OPEN_WEBUI_URL=http://open-webui:8080 \
-  -e OPEN_WEBUI_API_KEY=sk-... \
-  -e OIKB_API_KEY=your-daemon-key \
-  -e LOG_FORMAT=json \
-  -v ./.oikb.yaml:/data/.oikb.yaml:ro \
-  -p 8080:8080 \
-  ghcr.io/open-webui/oikb:latest daemon
-```
+- SHA-256 hashes are cached by revision; unchanged notes avoid repeat downloads.
+  Cache loss causes a fresh scan. Override its temporary-directory location with
+  `LIVESYNC_HASH_CACHE_DIR`.
+- Downloads stream to temporary disk snapshots. Defaults: 32 MiB/file and
+  256 MiB/scan; override connector options `max_file_bytes` and
+  `max_snapshot_bytes`. Uploads still hold a selected file in RAM.
+- OIKB filters and cancellation apply **after scanning**. Excluded files may
+  still download or block a scan. Network waits use the request timeout.
+- Revision/hash checks reject source changes during reads. Existing KB notes
+  with missing/legacy hashes, or identical content at different paths, can
+  still trigger duplicate-content errors; there is no automatic reconciliation.
 
-### Docker Compose
+## Safety and health
 
-```yaml
-services:
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    ports:
-      - "3000:8080"
+Use dedicated mirror KBs: source deletions remove destination files, and an
+empty source clears its mirror. Replacements require confirmed uploads;
+partial runs block unrelated cleanup. Back up KB-only content before clearing
+a KB; it cannot be restored from LiveSync.
 
-  oikb:
-    image: ghcr.io/open-webui/oikb:latest
-    environment:
-      - OPEN_WEBUI_URL=http://open-webui:8080
-      - OPEN_WEBUI_API_KEY=${OPEN_WEBUI_API_KEY}
-      - OIKB_API_KEY=${OIKB_API_KEY}
-      - LOG_FORMAT=json
-    volumes:
-      - ./.oikb.yaml:/data/.oikb.yaml:ro
-    command: daemon
-    ports:
-      - "8080:8080"
-    depends_on:
-      - open-webui
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health/ready"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-```
-
-## 47 Connectors
-
-| Category | Sources |
-|---|---|
-| **Code Repos** | GitHub, GitLab, Bitbucket |
-| **Cloud Storage & Sync** | S3, GCS, Azure Blob, Dropbox, R2, Google Drive, SharePoint, Nextcloud, Egnyte, Oracle Cloud, LiveSync |
-| **Wikis & KBs** | Confluence, Notion, BookStack, Discourse, GitBook, Guru, Outline, Slab, Document360, DokuWiki, Google Sites |
-| **Ticketing** | Jira, Linear, Zendesk, Freshdesk, Asana, ClickUp, Airtable, ServiceNow, ProductBoard |
-| **Messaging** | Slack, Discord, Microsoft Teams, Gmail, Zulip |
-| **Meetings** | Gong, Fireflies |
-| **Forums** | XenForo |
-| **Sales & CRM** | Salesforce, HubSpot |
-| **Web** | Website / Sitemap crawler |
-| **Research** | Zotero |
-
-```bash
-oikb sync github:owner/repo --kb-id your-kb-id
-oikb sync confluence:ENG --kb-id your-kb-id
-oikb sync s3://bucket/prefix --kb-id your-kb-id
-oikb sync livesync:Knowledge/software-engineering --kb-id your-kb-id
-oikb sync nextcloud:/Documents --kb-id your-kb-id
-oikb sync servicenow:incident --kb-id your-kb-id
-oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id
-```
-
-Some connectors need an optional extra: `pip install oikb[gdrive]`, `pip install oikb[s3]`, `pip install oikb[zotero]`, or `pip install oikb[all]` for everything. LiveSync uses standard HTTP and has no extra dependencies.
-
-### LiveSync
-
-```bash
-export LIVESYNC_GATEWAY_URL=http://livesync-api-gateway
-export LIVESYNC_GATEWAY_TOKEN=...
-
-oikb sync livesync:Knowledge/software-engineering --kb-id your-kb-id
-```
-
-Example `.oikb.yaml` configuration:
-
-```yaml
-sources:
-  - name: engineering
-    source: livesync:Knowledge/software-engineering
-    kb-id: ${ENGINEERING_KB_ID}
-    filter:
-      include: ["**/*.md"]
-```
-
-### Zotero
-
-```bash
-export ZOTERO_LIBRARY_ID=123456
-export ZOTERO_API_KEY=...
-
-oikb sync "zotero:" --kb-id your-kb-id # syncs all top-level collections plus _unfiled
-oikb sync "zotero:Research" --kb-id your-kb-id # syncs only the 'Research' collection
-oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id # syncs only the 'Machine Learning' subcollection
-```
-
-Options:
-
-| Variable | Description |
-|---|---|
-| `ZOTERO_LIBRARY_TYPE` | `user` (default) or `group` |
-| `ZOTERO_INCLUDE_NOTES` | Append child notes when set to `1`, `true`, `yes`, or `on` |
-| `ZOTERO_INCLUDE_ANNOTATIONS` | Append PDF annotation text/comments |
-| `ZOTERO_CHECKSUM` | `version` (default) or `content` |
-| `ZOTERO_EXCLUDE` | Comma-separated collection paths to skip |
-| `ZOTERO_UNFILED_DIR` | Directory for root library items, default `_unfiled` |
-| `ZOTERO_WEBDAV_URL` | WebDAV Zotero storage base; fetches `<attachment-key>.zip` on Zotero file 404 |
-| `ZOTERO_WEBDAV_USER` / `ZOTERO_WEBDAV_PASSWORD` | WebDAV credentials |
-
-## Filters
-
-Narrow what gets synced with include/exclude globs and size limits:
-
-```yaml
-sources:
-  - name: docs
-    source: github:owner/repo
-    kb-id: 4e7d9a0f-...
-    filter:
-      include: ["docs/**/*.md", "*.txt"]
-      exclude: ["drafts/**"]
-      max-size: 50mb
-```
-
-To split a single source across multiple Knowledge Bases, use separate entries:
-
-```yaml
-sources:
-  - name: wiki-docs
-    source: github:owner/repo
-    kb-id: abc123-...
-    filter:
-      include: ["docs/**/*.md"]
-
-  - name: wiki-code
-    source: github:owner/repo
-    kb-id: def456-...
-    filter:
-      include: ["src/**"]
-```
-
-## Configuration
-
-Resolved in order (highest priority wins):
-
-1. **CLI flags** (`--url`, `--token`)
-2. **Environment variables** (`OPEN_WEBUI_URL`, `OPEN_WEBUI_API_KEY`)
-3. **Config file** (`~/.config/oikb/config.yaml`)
-
-All string values in `.oikb.yaml` support `${VAR}` and `${VAR:-default}` interpolation:
-
-```yaml
-sources:
-  - name: docs
-    source: github:${GITHUB_ORG}/docs
-    kb-id: ${KB_DOCS_ID}
-    token: ${GITHUB_TOKEN}
-    notify:
-      url: ${SLACK_WEBHOOK:-https://hooks.slack.com/default}
-```
-
-## History
-
-```bash
-oikb history                    # Table view
-oikb history --json             # JSON output
-oikb history --errors           # Failed syncs only
-oikb history --clear --days 7   # Prune old entries
-```
-
-## GitHub Actions
-
-```yaml
-- name: Sync docs to Open WebUI
-  uses: docker://ghcr.io/open-webui/oikb:latest
-  with:
-    args: sync /github/workspace/docs --kb-id ${{ secrets.KB_ID }}
-  env:
-    OPEN_WEBUI_URL: ${{ secrets.OPEN_WEBUI_URL }}
-    OPEN_WEBUI_API_KEY: ${{ secrets.OPEN_WEBUI_API_KEY }}
-```
-
-## How It Works
-
-1. Scan source, compute checksums
-2. Send manifest to Open WebUI `/sync/diff`
-3. Create missing directories
-4. Upload new and modified files; wait for indexing and durable KB linking
-5. Remove each successfully replaced old file, then remove source deletions only
-   when the entire run completed without errors or warnings
-
-### LiveSync mirror safety
-
-The native connector calls the gateway directly, with no adapter. Independent
-sources such as `livesync:Atlas/Productivity`, `livesync:Atlas/Agreements` and
-`livesync:Efforts/Driving` can target separately named KBs. Use a dedicated KB for
-each mirror: a successful empty source manifest removes its last mirrored file.
-Malformed/incomplete listings, duplicate paths, out-of-root files and LiveSync
-conflicts abort scanning before any destination mutation.
-
-With a shared scope catalogue, use `livesync:?scope=productivity` and set
-`LIVESYNC_SCOPES_FILE=/etc/livesync-scopes/scopes.json`. The native connector
-resolves the named scope's path from that JSON file; no adapter or generated
-configuration is involved. Missing scopes or missing list/read permission abort
-the scan. Existing `livesync:Atlas/Productivity` sources still work. Scope names
-are independent of KB names, and the catalogue can include extra gateway-only
-scopes for other services that OIKB never mirrors. See cluster-configs
-`kubernetes/obsidian-notes/scopes.yaml` and `configmap.yaml` for the deployment.
-
-Uploads are not counted as successful until Open WebUI reports completed
-processing and the new file ID is linked to the destination KB. Empty files are
-submitted normally; if Open WebUI cannot index them, the run reports an error
-and retains the old indexed version. Missing source files also retain their old
-version and mark the run partial. Cleanup is not a distributed transaction: a
-process crash or cleanup failure after upload can leave duplicate versions that
-need reconciliation. Never reset the KB merely to recover a failed upload.
-
-Some Open WebUI versions remove vectors by content hash during cleanup. OIKB
-therefore refuses replacement cleanup when old/new indexed hashes match or are
-missing, preserving data and reporting the issue instead of silently deleting
-shared vectors. Resolve such duplicate-content cases in Open WebUI before
-retrying; a backend transaction is needed for completely atomic replacements.
-
-The daemon's `/livez` is independent of remote outages. `/health/ready` and
-`/health` return 503 for failed/partial mirrors, dead schedulers, or overdue jobs.
 Use `/livez` for startup/liveness and `/health/ready` for readiness.
+Readiness can return 503 while the process runs if syncs are partial, failing,
+overdue, or have never succeeded. `/health` shows per-source details.
 
-CI automatically builds/publishes on `main`, using the checked-in lockfile. It
-tests the connector against the published gateway image, so merge the gateway
-changes first. `tests/test_gateway_contract.py` is opt-in locally via
-`OIKB_TEST_GATEWAY_URL`, `OIKB_TEST_GATEWAY_TOKEN`, and
-`LIVESYNC_SCOPES_FILE=tests/fixtures/livesync-scopes.json`; use a disposable
-gateway configured with the same scope fixture.
+## Tests
 
-## License
+```sh
+uv run --extra dev pytest -q
+```
 
-MIT. See [LICENSE](LICENSE) for details.
+The optional gateway contract test requires a **disposable** gateway and
+`OIKB_TEST_GATEWAY_URL`, `OIKB_TEST_GATEWAY_TOKEN`, and `LIVESYNC_SCOPES_FILE`.
+
+[MIT license](LICENSE).

@@ -1,5 +1,6 @@
 """Opt-in cross-repo contract against a disposable real gateway/CLI container."""
 import os
+import hashlib
 import time
 import uuid
 
@@ -37,9 +38,12 @@ def test_real_gateway_multiple_mirrors():
                     manifest = connector.build_manifest()
                     assert {entry.display_path for entry in manifest} == {relative_prefix+'/note.md', relative_prefix+'/nested/note.md'}
                     for entry in manifest:
-                        assert entry.checksum and entry.size == 11
+                        assert entry.checksum == hashlib.sha256(b'# Contract\n').hexdigest() and entry.size == 11
                         assert connector.read_file(entry.path, entry.filename) == b'# Contract\n'
                     api.post('/hooks/livesync-write', json={'path': files[0], 'content': ''}).raise_for_status()
+                    # A scan is a stable snapshot; refresh to see subsequent edits.
+                    assert connector.read_file(relative_prefix, 'note.md') == b'# Contract\n'
+                    connector.build_manifest()
                     assert connector.read_file(relative_prefix, 'note.md') == b''
             finally:
                 for path in files:

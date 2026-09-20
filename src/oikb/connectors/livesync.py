@@ -6,15 +6,23 @@ Gateway URL via LIVESYNC_GATEWAY_URL env var or connector config.
 
 from __future__ import annotations
 
-import os
+import hashlib
 import json
+import logging
+import os
+from dataclasses import replace
 from pathlib import Path
+from tempfile import NamedTemporaryFile, TemporaryDirectory, gettempdir
+from threading import Lock
 from typing import Any
 from urllib.parse import parse_qsl
 
 import httpx
 
 from oikb.connectors import BaseConnector, ManifestEntry, SourceFileUnavailable
+
+_log = logging.getLogger(__name__)
+_MAX_CACHE_BYTES = 8 * 1024 * 1024
 
 
 class LiveSyncConnector(BaseConnector):
@@ -26,6 +34,9 @@ class LiveSyncConnector(BaseConnector):
         token:       Bearer token for gateway auth (or LIVESYNC_GATEWAY_TOKEN env var).
         timeout:     HTTP request timeout in seconds (default: 120.0).
         client:      Optional existing httpx.Client instance (for testing).
+        cache_dir:   Hash metadata cache directory (or LIVESYNC_HASH_CACHE_DIR).
+        max_file_bytes: Maximum downloaded/uploaded file size (default: 32 MiB).
+        max_snapshot_bytes: Temporary file budget per scan (default: 256 MiB).
     """
 
     def __init__(
@@ -41,6 +52,9 @@ class LiveSyncConnector(BaseConnector):
         client: httpx.Client | None = None,
         scope: str | None = None,
         scopes_file: str | None = None,
+        cache_dir: str | None = None,
+        max_file_bytes: int = 32 * 1024 * 1024,
+        max_snapshot_bytes: int = 256 * 1024 * 1024,
         **kwargs: Any,
     ):
         raw_root = path if path is not None else root
@@ -110,11 +124,64 @@ class LiveSyncConnector(BaseConnector):
             headers=headers,
             timeout=timeout,
         )
-        # Mapping from (dir_path, filename) and display_path to remote gateway path
-        self._file_paths: dict[tuple[str, str], str] = {}
+        self._snapshot_dir: TemporaryDirectory | None = None
+        self._snapshots: dict[tuple[str, str], Path] = {}
+        self._manifest: dict[tuple[str, str], ManifestEntry] = {}
+        self._listed: dict[tuple[str, str], ManifestEntry] = {}
+        self._snapshot_bytes = 0
+        self._budget_lock = Lock()
+        self._max_file_bytes = int(max_file_bytes)
+        self._max_snapshot_bytes = int(max_snapshot_bytes)
+        if min(self._max_file_bytes, self._max_snapshot_bytes) <= 0:
+            raise ValueError("LiveSync download limits must be positive byte counts")
+        cache_root = cache_dir or os.environ.get("LIVESYNC_HASH_CACHE_DIR") or str(
+            Path(gettempdir()) / f"oikb-livesync-hashes-{getattr(os, 'getuid', lambda: 'user')()}"
+        )
+        # Separate endpoints, scopes/roots and credentials; never persist tokens.
+        identity = json.dumps([self.gateway_url, self.root, self.token], ensure_ascii=True)
+        self._cache_path = Path(cache_root) / (hashlib.sha256(identity.encode()).hexdigest() + ".json")
 
     def build_manifest(self) -> list[ManifestEntry]:
-        """Scan the LiveSync gateway and return a manifest of all files under root."""
+        """Download only revisions without a cached hash; OIKB filters later."""
+        self._clear_snapshots()
+        self._manifest.clear()
+        self._listed.clear()
+        listed = self._list_entries()
+        cached = self._load_cache()
+        updated = {}
+        entries = []
+        downloaded = False
+        self._snapshot_dir = TemporaryDirectory(prefix="oikb-livesync-")
+        try:
+            for entry in listed:
+                key = (entry.path, entry.filename)
+                self._listed[key] = entry
+                hit = cached.get(entry.display_path)
+                if hit and hit["revision"] == entry.checksum and hit["listed_size"] == entry.size:
+                    actual = replace(entry, checksum=hit["sha256"], size=hit["size"])
+                    if actual.size > self._max_file_bytes:
+                        raise SourceFileUnavailable(f"LiveSync file exceeds download limit: {entry.display_path}")
+                else:
+                    actual = self._download(entry)
+                    downloaded = True
+                entries.append(actual)
+                updated[entry.display_path] = {
+                    "revision": entry.checksum, "listed_size": entry.size,
+                    "sha256": actual.checksum, "size": actual.size,
+                }
+            if downloaded:
+                # List again using existing list/read permissions, not info.
+                # Never cache bytes under a revision that changed mid-download.
+                self._verify_revisions(self._listed)
+            self._manifest = {(e.path, e.filename): e for e in entries}
+            self._save_cache(updated)
+            return entries
+        except BaseException:
+            self._manifest.clear()
+            self._clear_snapshots()
+            raise
+
+    def _list_entries(self) -> list[ManifestEntry]:
         payload: dict[str, str] = {}
         if self.root:
             payload["path"] = self.root
@@ -130,7 +197,6 @@ class LiveSyncConnector(BaseConnector):
         raw_entries = data["files"]
         if data.get("count") != len(raw_entries):
             raise ValueError("Incomplete LiveSync manifest; refusing destructive sync")
-        self._file_paths.clear()
 
         # Reject ambiguous manifests rather than deleting from an incomplete view.
         entries_by_path: dict[str, ManifestEntry] = {}
@@ -190,11 +256,103 @@ class LiveSyncConnector(BaseConnector):
             if display in entries_by_path:
                 raise ValueError(f"Duplicate LiveSync path: {raw_path}")
             entries_by_path[display] = entry
-            self._file_paths[(dir_path, filename)] = raw_path
-            self._file_paths[(display, "")] = raw_path
 
-        entries = sorted(entries_by_path.values(), key=lambda e: e.display_path)
-        return entries
+        return sorted(entries_by_path.values(), key=lambda e: e.display_path)
+
+    def _verify_revisions(self, expected: dict[tuple[str, str], ManifestEntry]) -> None:
+        current = {(e.path, e.filename): e for e in self._list_entries()}
+        for key, before in expected.items():
+            if current.get(key) != before:
+                raise SourceFileUnavailable(f"LiveSync source changed during scan: {before.display_path}; retry next sync")
+
+    def _download(self, entry: ManifestEntry) -> ManifestEntry:
+        """Stream one bounded file to a private snapshot and hash the same bytes."""
+        if entry.size > self._max_file_bytes:
+            raise SourceFileUnavailable(f"LiveSync file exceeds download limit: {entry.display_path}")
+        if self._snapshot_dir is None:
+            self._snapshot_dir = TemporaryDirectory(prefix="oikb-livesync-")
+        remote_path = "/".join(p for p in (self.root, entry.display_path) if p)
+        digest, size, reserved = hashlib.sha256(), 0, 0
+        # Unique temp names also support concurrent upload reads after a warm scan.
+        with NamedTemporaryFile(dir=self._snapshot_dir.name, delete=False) as output:
+            snapshot = Path(output.name)
+            try:
+                with self._http.stream("POST", "/hooks/livesync-read", json={"path": remote_path}) as resp:
+                    if resp.status_code == 404:
+                        raise SourceFileUnavailable(f"File '{entry.display_path}' not found on LiveSync gateway")
+                    if not resp.is_success:
+                        # The existing upload error handler reads response.text.
+                        # Preserve a bounded error body without buffering an
+                        # unlimited streaming response or using private fields.
+                        error_body = bytearray()
+                        for chunk in resp.iter_bytes(chunk_size=4096):
+                            error_body.extend(chunk)
+                            if len(error_body) >= 16384:
+                                break
+                        httpx.Response(resp.status_code, content=bytes(error_body), request=resp.request).raise_for_status()
+                    resp.raise_for_status()
+                    for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                        size += len(chunk)
+                        if size > self._max_file_bytes:
+                            raise SourceFileUnavailable(f"LiveSync file exceeds download limit: {entry.display_path}")
+                        with self._budget_lock:
+                            if self._snapshot_bytes + len(chunk) > self._max_snapshot_bytes:
+                                raise SourceFileUnavailable("LiveSync snapshot disk budget exceeded; existing KB preserved")
+                            self._snapshot_bytes += len(chunk)
+                            reserved += len(chunk)
+                        output.write(chunk)
+                        digest.update(chunk)
+            except BaseException:
+                output.close()
+                snapshot.unlink(missing_ok=True)
+                with self._budget_lock:
+                    self._snapshot_bytes -= reserved
+                raise
+        self._snapshots[(entry.path, entry.filename)] = snapshot
+        return replace(entry, checksum=digest.hexdigest(), size=size)
+
+    def _load_cache(self) -> dict[str, dict]:
+        """Invalid/unavailable metadata is a cache miss, never an empty source."""
+        try:
+            with self._cache_path.open("rb") as source:
+                raw = source.read(_MAX_CACHE_BYTES + 1)
+            if len(raw) > _MAX_CACHE_BYTES:
+                return {}
+            data = json.loads(raw)
+            if data.get("version") != 1 or not isinstance(data.get("files"), dict):
+                return {}
+            valid = {}
+            for path, item in data["files"].items():
+                if (isinstance(item, dict) and isinstance(item.get("revision"), str)
+                    and type(item.get("size")) is int and item["size"] >= 0
+                    and type(item.get("listed_size")) is int and item["listed_size"] >= 0
+                    and isinstance(item.get("sha256"), str) and len(item["sha256"]) == 64
+                    and all(c in "0123456789abcdef" for c in item["sha256"])):
+                    valid[path] = item
+            return valid
+        except (OSError, ValueError, AttributeError, RecursionError):
+            return {}
+
+    def _save_cache(self, entries: dict[str, dict]) -> None:
+        temporary = None
+        try:
+            payload = json.dumps({"version": 1, "files": entries}).encode()
+            if len(payload) > _MAX_CACHE_BYTES:
+                _log.warning("LiveSync hash cache exceeds metadata limit; skipping cache write")
+                return
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with NamedTemporaryFile(dir=self._cache_path.parent, delete=False) as output:
+                temporary = Path(output.name)
+                output.write(payload)
+            os.replace(temporary, self._cache_path)
+        except OSError:
+            _log.warning("LiveSync hash cache unavailable; future scans may re-download files")
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    _log.warning("Could not remove temporary LiveSync hash cache file")
 
     def read_file(self, path: str, filename: str) -> bytes:
         """Read raw file content from the LiveSync gateway.
@@ -207,42 +365,38 @@ class LiveSyncConnector(BaseConnector):
             Raw bytes of the file content.
         """
         key = (path, filename)
-        display = f"{path}/{filename}" if path else filename
-
-        if key in self._file_paths:
-            remote_path = self._file_paths[key]
-        elif (display, "") in self._file_paths:
-            remote_path = self._file_paths[(display, "")]
-        else:
-            rel = display
-            if self.root:
-                remote_path = f"{self.root}/{rel}"
-            else:
-                remote_path = rel
-
-        def read(remote_file_path: str) -> httpx.Response:
-            return self._http.post(
-                "/hooks/livesync-read",
-                json={"path": remote_file_path.lstrip("/")},
-            )
-
+        if key in self._snapshots:
+            return self._snapshots[key].read_bytes()
+        expected = self._manifest.get(key)
+        listed = self._listed.get(key)
         try:
-            resp = read(remote_path)
-            if resp.status_code == 404:
-                raise SourceFileUnavailable(
-                    f"File '{display}' not found on LiveSync gateway (path: {remote_path})"
-                )
-            resp.raise_for_status()
-            return resp.content
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 404:
-                raise SourceFileUnavailable(
-                    f"File '{display}' not found on LiveSync gateway: {exc}"
-                ) from exc
+            if expected and listed:
+                self._verify_revisions({key: listed})
+            actual = self._download(listed or ManifestEntry(filename, path, "", 0))
+            if expected and listed:
+                self._verify_revisions({key: listed})
+                if actual.checksum != expected.checksum or actual.size != expected.size:
+                    cached = self._load_cache()
+                    cached.pop(expected.display_path, None)
+                    self._save_cache(cached)
+                    raise SourceFileUnavailable(f"LiveSync content changed since manifest: {expected.display_path}; retry next sync")
+            return self._snapshots[key].read_bytes()
+        except BaseException:
+            snapshot = self._snapshots.pop(key, None)
+            if snapshot is not None:
+                snapshot.unlink(missing_ok=True)
             raise
 
+    def _clear_snapshots(self) -> None:
+        self._snapshots.clear()
+        self._snapshot_bytes = 0
+        if self._snapshot_dir is not None:
+            self._snapshot_dir.cleanup()
+            self._snapshot_dir = None
+
     def close(self) -> None:
-        """Release HTTP client if owned."""
+        """Release this scan's temporary files and HTTP client if owned."""
+        self._clear_snapshots()
         if self._own_client:
             self._http.close()
 
