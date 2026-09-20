@@ -59,7 +59,8 @@ jobs:
             -e GATEWAY_API_KEY=contract-test \
             -e LIVESYNC_SCOPES_FILE=/tmp/livesync-scopes.json \
             -e SYNC_ON_READ=false -e SYNC_ON_WRITE=false \
-            -e 'LIVESYNC_SETTINGS_JSON={"isConfigured":true,"couchDB_URI":"http://127.0.0.1:1","couchDB_DBNAME":"test","couchDB_USER":"test","couchDB_PASSWORD":"test","useIndexedDBAdapter":false,"liveSync":false,"syncOnStart":false}' \
+            -e COUCHDB_URI=http://127.0.0.1:1 -e COUCHDB_DBNAME=test \
+            -e COUCHDB_USER=test -e COUCHDB_PASSWORD=test -e LIVESYNC_ENCRYPT=false \
             registry.home.destinesiastudio.com/destinesiastudio/livesync-api-gateway:latest
           docker cp tests/fixtures/livesync-scopes.json "$container:/tmp/livesync-scopes.json"
           docker start "$container"
