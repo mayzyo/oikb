@@ -55,18 +55,17 @@ jobs:
           test_container="${network}-tests"
           trap 'status=$?; if [ "$status" -ne 0 ]; then echo "Gateway container logs:" >&2; docker logs "$container" >&2 || true; fi; docker rm -fv "$test_container" "$container" >/dev/null 2>&1 || true; docker network rm "$network" >/dev/null 2>&1 || true; exit "$status"' EXIT
           docker network create "$network"
-          # A gateway publish can race this cross-repository job. Keep the old
-          # variable only as a compatibility input for the previously published image.
-          docker create --name "$container" --network "$network" --network-alias gateway --pull always \
+          # Generate a dummy Setup URI using the gateway's own pinned library.
+          docker create --name "$container" --network "$network" --network-alias gateway --pull always --entrypoint /bin/sh \
             -e GATEWAY_API_KEY=contract-test \
             -e LIVESYNC_SCOPES_FILE=/tmp/livesync-scopes.json \
             -e SYNC_ON_READ=false -e SYNC_ON_WRITE=false \
-            -e LIVESYNC_AUTO_CONFIG=false \
-            -e COUCHDB_URI=http://127.0.0.1:1 \
-            -e LIVESYNC_VAULT_DATABASE=test -e COUCHDB_DBNAME=test \
-            -e COUCHDB_USER=test -e COUCHDB_PASSWORD=test -e LIVESYNC_ENCRYPT=false \
-            registry.home.destinesiastudio.com/destinesiastudio/livesync-api-gateway:latest
+            -e LIVESYNC_SETUP_URI_FILE=/tmp/livesync-setup-uri \
+            -e LIVESYNC_SETUP_PASSPHRASE=contract-export-key \
+            registry.home.destinesiastudio.com/destinesiastudio/livesync-api-gateway:latest \
+            -ec 'umask 077; node /tmp/gateway-setup.cjs > /tmp/livesync-setup-uri; exec /app/entrypoint.sh'
           docker cp tests/fixtures/livesync-scopes.json "$container:/tmp/livesync-scopes.json"
+          docker cp tests/fixtures/gateway-setup.cjs "$container:/tmp/gateway-setup.cjs"
           docker start "$container"
           docker create --name "$test_container" --network "$network" -w /src \
             -e OIKB_TEST_GATEWAY_URL=http://gateway:9000 -e OIKB_TEST_GATEWAY_TOKEN=contract-test \
