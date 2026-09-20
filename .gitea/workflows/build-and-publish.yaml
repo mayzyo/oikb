@@ -61,6 +61,7 @@ jobs:
             -e GATEWAY_API_KEY=contract-test \
             -e LIVESYNC_SCOPES_FILE=/tmp/livesync-scopes.json \
             -e SYNC_ON_READ=false -e SYNC_ON_WRITE=false \
+            -e LIVESYNC_AUTO_CONFIG=false \
             -e COUCHDB_URI=http://127.0.0.1:1 \
             -e LIVESYNC_VAULT_DATABASE=test -e COUCHDB_DBNAME=test \
             -e COUCHDB_USER=test -e COUCHDB_PASSWORD=test -e LIVESYNC_ENCRYPT=false \
